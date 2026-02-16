@@ -1,5 +1,7 @@
+pub mod connection;
 mod master;
 mod slave;
 
-pub use master::TixMasterState;
-pub use slave::TixSlaveState;
+pub use connection::{ConnectionPhase, PeerCapabilities};
+pub use master::{MasterState, TrackedRequest};
+pub use slave::SlaveState;

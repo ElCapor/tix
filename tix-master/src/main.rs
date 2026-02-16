@@ -1,20 +1,19 @@
 /*
-##    ##    ###     ######  ######## ######## ####### 
+##    ##    ###     ######  ######## ######## #######
 ###  ###   ## ##   ##    ##    ##    ##       ##    ##
 ########  ##   ##  ##          ##    ##       ##    ##
-## ## ## ##     ##  ######     ##    ######   ####### 
-##    ## #########       ##    ##    ##       ##  ##  
-##    ## ##     ## ##    ##    ##    ##       ##   ## 
+## ## ## ##     ##  ######     ##    ######   #######
+##    ## #########       ##    ##    ##       ##  ##
+##    ## ##     ## ##    ##    ##    ##       ##   ##
 ##    ## ##     ##  ######     ##    ######## ##    ##
 */
 
-
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::{backend::CrosstermBackend, Terminal};
-use tix_master::{App, Master, MasterEvent, UiEvent};
-use tix_core::ConnectionInfo;
-use tokio::sync::mpsc;
+use ratatui::{Terminal, backend::CrosstermBackend};
 use std::time::Duration;
+use tix_core::ConnectionInfo;
+use tix_master::{App, Master, MasterEvent, UiEvent};
+use tokio::sync::mpsc;
 
 #[tokio::main]
 pub async fn main() -> std::io::Result<()> {
@@ -27,21 +26,21 @@ pub async fn main() -> std::io::Result<()> {
     let input_ui_tx = ui_tx.clone();
     tokio::task::spawn_blocking(move || {
         loop {
-            if event::poll(Duration::from_millis(10)).unwrap_or(false) {
-                if let Ok(event) = event::read() {
-                    match event {
-                        Event::Key(key) => {
-                            if let Err(_) = input_ui_tx.send(UiEvent::Key(key)) {
-                                break;
-                            }
+            if event::poll(Duration::from_millis(10)).unwrap_or(false)
+                && let Ok(event) = event::read()
+            {
+                match event {
+                    Event::Key(key) => {
+                        if input_ui_tx.send(UiEvent::Key(key)).is_err() {
+                            break;
                         }
-                        Event::Resize(w, h) => {
-                            if let Err(_) = input_ui_tx.send(UiEvent::Resize(w, h)) {
-                                break;
-                            }
-                        }
-                        _ => {}
                     }
+                    Event::Resize(w, h) => {
+                        if input_ui_tx.send(UiEvent::Resize(w, h)).is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
                 }
             }
         }
@@ -54,10 +53,17 @@ pub async fn main() -> std::io::Result<()> {
         let mut master = match Master::listen(conn_info, master_event_tx.clone()).await {
             Ok(m) => m,
             Err(e) => {
-                let _ = master_event_tx.send(MasterEvent::Log(format!("Critical Error: Failed to start listener: {}", e)));
+                let _ = master_event_tx.send(MasterEvent::Log(format!(
+                    "Critical Error: Failed to start listener: {}",
+                    e
+                )));
                 return;
             }
         };
+
+        // Interval for checking request timeouts
+        let mut timeout_check = tokio::time::interval(Duration::from_secs(2));
+        timeout_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
@@ -67,7 +73,7 @@ pub async fn main() -> std::io::Result<()> {
                         let _ = master_event_tx.send(MasterEvent::Log(format!("Command Error: {}", e)));
                     }
                 }
-                
+
                 // Handle network operations
                 _ = async {
                     if !master.is_connected() {
@@ -76,6 +82,11 @@ pub async fn main() -> std::io::Result<()> {
                         let _ = master.process_connection().await;
                     }
                 } => {}
+
+                // Check for timed-out requests
+                _ = timeout_check.tick() => {
+                    master.check_timeouts();
+                }
             }
         }
     });
@@ -87,7 +98,7 @@ pub async fn main() -> std::io::Result<()> {
     terminal.clear()?;
 
     let mut app = App::new();
-    
+
     // 5. Main UI Event Loop (Purely Reactive)
     loop {
         terminal.draw(|f| app.draw(f))?;
@@ -108,16 +119,16 @@ pub async fn main() -> std::io::Result<()> {
                                 KeyCode::F(1) => app.set_tab(tix_master::Tab::Main),
                                 KeyCode::F(2) => {
                                     app.set_tab(tix_master::Tab::TreeExplorer);
-                                    if app.tree_explorer.slave_tree.root_nodes.is_empty() {
-                                        if let Some(cmd) = app.refresh_slave_drives() {
-                                            let _ = cmd_tx.send(cmd);
-                                        }
+                                    if app.tree_explorer.slave_tree.root_nodes.is_empty()
+                                        && let Some(cmd) = app.refresh_slave_drives()
+                                    {
+                                        let _ = cmd_tx.send(cmd);
                                     }
                                 },
                                 KeyCode::F(3) => app.set_tab(tix_master::Tab::SystemSettings),
                                 KeyCode::Char('q') => app.exit = true,
                                 KeyCode::Esc => app.handle_esc(),
-                                
+
                                 // Tab-specific navigation
                                 KeyCode::Up if app.active_tab == tix_master::Tab::TreeExplorer => app.tree_cursor_up(),
                                 KeyCode::Down if app.active_tab == tix_master::Tab::TreeExplorer => app.tree_cursor_down(),
@@ -159,8 +170,8 @@ pub async fn main() -> std::io::Result<()> {
                                     app.command_to_execute.push(c);
                                     app.on_input_change();
                                 }
-                                KeyCode::Backspace if app.active_tab == tix_master::Tab::Main => { 
-                                    app.command_to_execute.pop(); 
+                                KeyCode::Backspace if app.active_tab == tix_master::Tab::Main => {
+                                    app.command_to_execute.pop();
                                     app.on_input_change();
                                 },
                                 KeyCode::Up if app.active_tab == tix_master::Tab::Main => app.handle_up(),
@@ -187,7 +198,7 @@ pub async fn main() -> std::io::Result<()> {
                         }
                     }
                     UiEvent::Resize(_, _) => {
-                        // Ratatui handles resize automatically on draw, 
+                        // Ratatui handles resize automatically on draw,
                         // but we can trigger a redraw if we want.
                     }
                 }
@@ -210,6 +221,6 @@ pub async fn main() -> std::io::Result<()> {
     // Restore terminal
     crossterm::terminal::disable_raw_mode()?;
     crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen)?;
-    
+
     Ok(())
 }

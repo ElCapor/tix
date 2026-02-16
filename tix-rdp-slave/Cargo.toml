@@ -1,0 +1,26 @@
+[package]
+name = "tix-rdp-slave"
+version = "0.1.0"
+edition = "2024"
+description = "TIX RDP slave service — screen capture and input injection"
+
+[[bin]]
+name = "tix-rdp-slave"
+path = "src/main.rs"
+
+[dependencies]
+tix-core = { path = "../tix-core" }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Services",
+    "Win32_Security",
+] }

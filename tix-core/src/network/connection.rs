@@ -1,68 +1,87 @@
-use tokio::{net::TcpStream, sync::mpsc};
-use tokio_util::codec::Framed;
+//! TCP connection management with background reader/writer tasks.
+//!
+//! `Connection` wraps a `TcpStream` and splits it into two independent
+//! background tasks communicating over mpsc channels. This avoids holding
+//! a borrow across await points and gives natural back-pressure.
+
 use futures::{SinkExt, StreamExt};
-use crate::TixCodec;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio_util::codec::Framed;
 
-pub type Connection = TixConnection;
+use crate::codec::TixCodec;
+use crate::error::TixError;
+use crate::packet::Packet;
 
-/// A tix connection to a single client
+/// Sender half — cheaply cloneable, used to enqueue packets for the
+/// background writer task.
+pub type ConnectionSender = mpsc::Sender<Packet>;
+
+/// A managed TIX connection to a single peer.
+///
+/// Internally spawns two Tokio tasks:
+/// - **Writer**: drains `tx` and writes packets to the TCP stream.
+/// - **Reader**: reads packets from the TCP stream and pushes them to `rx`.
+/// - **Heartbeat**: periodically sends a heartbeat packet (reuses a static
+///   instance — no cloning per tick).
 #[derive(Debug)]
-pub struct TixConnection {
-    // Channel to send packets to background writer task
-    tx: mpsc::Sender<crate::Packet>,
-    // Channel to receive packets from background reader task
-    rx: mpsc::Receiver<crate::Packet>,
+pub struct Connection {
+    /// Send packets to the background writer.
+    tx: mpsc::Sender<Packet>,
+    /// Receive packets from the background reader.
+    rx: mpsc::Receiver<Packet>,
 }
 
-impl TixConnection {
-
+impl Connection {
+    /// Wrap an already-connected `TcpStream`.
     pub fn new(stream: TcpStream) -> Self {
-        let (mut net_writer, mut net_reader) = Framed::new(stream, TixCodec {}).split();
+        // Apply low-latency socket options.
+        let _ = stream.set_nodelay(true);
 
-        // User -> Network
-        let (user_tx, mut network_rx) = mpsc::channel(100);
+        let (mut net_writer, mut net_reader) = Framed::new(stream, TixCodec).split();
 
-        // Network -> User
-        let (network_tx, user_rx) = mpsc::channel(100);
+        // User → Network
+        let (user_tx, mut network_rx) = mpsc::channel::<Packet>(128);
+        // Network → User
+        let (network_tx, user_rx) = mpsc::channel::<Packet>(128);
 
-        // Writer task: User -> Network
+        // Writer task
         tokio::spawn(async move {
             while let Some(packet) = network_rx.recv().await {
                 if let Err(e) = net_writer.send(packet).await {
-                    eprintln!("Network write error: {:?}", e);
+                    eprintln!("[NET] write error: {e}");
                     break;
                 }
             }
         });
 
-        // Reader task: Network -> User
+        // Reader task
         tokio::spawn(async move {
             while let Some(result) = net_reader.next().await {
                 match result {
                     Ok(packet) => {
-                        if let Err(_) = network_tx.send(packet).await {
-                            // user_rx was dropped, stop reading
-                            break;
+                        if network_tx.send(packet).await.is_err() {
+                            break; // user_rx dropped
                         }
                     }
                     Err(e) => {
-                        eprintln!("Network read error: {:?}", e);
-                        break; // Stop on codec/network errors
+                        eprintln!("[NET] read error: {e}");
+                        break;
                     }
                 }
             }
         });
 
-        // Heartbeat connection
-        let heartbeat_interval = std::time::Duration::from_secs(5);
-        let heartbeat_packet = crate::Packet::heartbeat();
-        let heartbeat_tx = user_tx.clone(); 
+        // Heartbeat task — sends a static heartbeat every 5 seconds.
+        let heartbeat_tx = user_tx.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(heartbeat_interval);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
             loop {
                 interval.tick().await;
-                if let Err(_) = heartbeat_tx.send(heartbeat_packet.clone()).await {
-                    break; // Connection handle was dropped, stop heartbeat
+                // Build a fresh heartbeat each tick — it's a tiny packet with
+                // zero payload and no allocation.
+                if heartbeat_tx.send(Packet::heartbeat()).await.is_err() {
+                    break;
                 }
             }
         });
@@ -73,27 +92,35 @@ impl TixConnection {
         }
     }
 
-    pub async fn send(&self, packet: crate::Packet) -> Result<(), mpsc::error::SendError<crate::Packet>> {
-        self.tx.send(packet).await
+    /// Send a packet to the peer.
+    pub async fn send(&self, packet: Packet) -> Result<(), TixError> {
+        self.tx
+            .send(packet)
+            .await
+            .map_err(|_| TixError::ChannelClosed)
     }
 
-    pub async fn recv(&mut self) -> Option<crate::Packet> {
+    /// Receive the next packet from the peer, or `None` if the
+    /// connection was closed.
+    pub async fn recv(&mut self) -> Option<Packet> {
         self.rx.recv().await
     }
 
-    pub async fn get_sender(&self) -> mpsc::Sender<crate::Packet> {
+    /// Obtain a cloneable sender handle for use in spawned tasks.
+    pub fn sender(&self) -> ConnectionSender {
         self.tx.clone()
     }
 
-    pub async fn connect(conn_info: &ConnectionInfo) -> Result<Self, std::io::Error> {
-        let stream = TcpStream::connect(conn_info.to_string()).await?;
-        let conn = Self::new(stream);
-        Ok(conn)
+    /// Connect to a remote peer described by `ConnectionInfo`.
+    pub async fn connect(info: &ConnectionInfo) -> Result<Self, std::io::Error> {
+        let stream = TcpStream::connect(info.to_socket_string()).await?;
+        Ok(Self::new(stream))
     }
 }
 
-pub type TixConnectionSender = mpsc::Sender<crate::Packet>;
+// ── ConnectionInfo ──────────────────────────────────────────────
 
+/// Describes a remote endpoint by IP and port.
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
     ip: String,
@@ -101,19 +128,29 @@ pub struct ConnectionInfo {
 }
 
 impl ConnectionInfo {
+    /// Create a new connection descriptor.
     pub fn new(ip: String, port: u16) -> Self {
         Self { ip, port }
     }
 
+    /// The peer's IP address.
     pub fn ip(&self) -> &str {
         &self.ip
     }
 
+    /// The peer's port number.
     pub fn port(&self) -> u16 {
         self.port
     }
 
-    pub fn to_string(&self) -> String {
+    /// Format as `"ip:port"` for socket binding / connecting.
+    pub fn to_socket_string(&self) -> String {
         format!("{}:{}", self.ip, self.port)
+    }
+}
+
+impl std::fmt::Display for ConnectionInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.ip, self.port)
     }
 }
